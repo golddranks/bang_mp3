@@ -1,3 +1,7 @@
+use header::FrameHeader;
+use side_info::SideInfo;
+use vbr::VbrInfo;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodingError {
     UnexpectedEndOfStream,
@@ -11,32 +15,97 @@ pub enum DecodingError {
 
 mod decoder;
 mod header;
+mod side_info;
+mod vbr;
+
+fn read_u16(data: &mut &[u8]) -> Result<u16, DecodingError> {
+    let int = u16::from_be_bytes(
+        data[..2]
+            .try_into()
+            .map_err(|_| DecodingError::UnexpectedEndOfStream)?,
+    );
+    *data = &data[2..];
+    Ok(int)
+}
+
+fn read_u32(data: &mut &[u8]) -> Result<u32, DecodingError> {
+    let int = u32::from_be_bytes(
+        data[..4]
+            .try_into()
+            .map_err(|_| DecodingError::UnexpectedEndOfStream)?,
+    );
+    *data = &data[4..];
+    Ok(int)
+}
+
+pub enum FirstFrame<'a> {
+    Vbr(FrameHeader, VbrInfo),
+    Cbr(Frame<'a>),
+}
+
+impl FirstFrame<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            FirstFrame::Vbr(header, _) => header.frame_bytes,
+            FirstFrame::Cbr(frame) => frame.header.frame_bytes,
+        }
+    }
+}
 
 pub struct Frame<'a> {
     pub header: header::FrameHeader,
-    pub data: &'a [u8],
+    pub side_info: side_info::SideInfo,
+    pub main_data: &'a [u8],
 }
 
 impl<'a> Frame<'a> {
-    pub fn read(data: &'a [u8]) -> Result<Self, DecodingError> {
+    fn read_header(data: &'a [u8]) -> Result<(FrameHeader, &'a [u8]), DecodingError> {
         if data.len() < 4 {
             return Err(DecodingError::UnexpectedEndOfStream);
         }
 
-        let header = match header::read(data) {
+        let header = match FrameHeader::read(data) {
             Ok(header) => header,
             Err(err) => return Err(err),
         };
 
-        let frame_len = header.frame_bytes as usize;
-        if data.len() < frame_len {
+        if data.len() < header.frame_bytes {
             return Err(DecodingError::UnexpectedEndOfStream);
         }
-        let frame_data = &data[..frame_len];
+
+        let frame_data = &data[header.len()..header.frame_bytes];
+
+        Ok((header, frame_data))
+    }
+
+    fn read_frame_data(
+        header: FrameHeader,
+        frame_data: &'a [u8],
+    ) -> Result<Frame<'a>, DecodingError> {
+        let side_info_len = SideInfo::len(header.channel_mode);
+        let side_info = SideInfo::read(&header, &frame_data[..side_info_len])?;
+        let main_data = &frame_data[side_info_len..];
+
         Ok(Frame {
             header,
-            data: frame_data,
+            side_info,
+            main_data,
         })
+    }
+
+    pub fn read_first(data: &'a [u8]) -> Result<FirstFrame<'a>, DecodingError> {
+        let (header, frame_data) = Frame::read_header(data)?;
+
+        if let Some(vbr_info) = VbrInfo::read(&header, &frame_data) {
+            Ok(FirstFrame::Vbr(header, vbr_info?))
+        } else {
+            Ok(FirstFrame::Cbr(Self::read_frame_data(header, frame_data)?))
+        }
+    }
+
+    pub fn read(data: &'a [u8]) -> Result<Self, DecodingError> {
+        let (header, frame_data) = Frame::read_header(data)?;
+        Self::read_frame_data(header, frame_data)
     }
 }
 
@@ -45,8 +114,15 @@ pub struct FrameIter<'a> {
 }
 
 impl<'a> FrameIter<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        FrameIter { data }
+    pub fn new(data: &'a [u8]) -> Result<(FirstFrame<'a>, Self), DecodingError> {
+        let first_frame = Frame::read_first(data)?;
+        let consumed = first_frame.len();
+        Ok((
+            first_frame,
+            FrameIter {
+                data: &data[consumed..],
+            },
+        ))
     }
 }
 
@@ -58,7 +134,9 @@ impl<'a> Iterator for FrameIter<'a> {
             return None;
         }
 
-        Some(Frame::read(self.data))
+        Some(Frame::read(self.data).inspect(|frame| {
+            self.data = &self.data[frame.header.frame_bytes..];
+        }))
     }
 }
 
@@ -69,10 +147,11 @@ mod tests {
 
     #[test]
     fn test_frame_iter_short() {
-        let data = read("tests/sine_320hz_50ms.mp3").unwrap();
-        let iter = FrameIter::new(&data);
+        let data = read("tests/sine_320hz_50ms_vbr.mp3").unwrap();
+        let (first_frame, iter) = FrameIter::new(&data).unwrap();
+        assert!(matches!(first_frame, FirstFrame::Vbr(_, _)));
 
-        let expected_lengths = vec![417, 731, 130, 365, /* EOS */ 9999];
+        let expected_lengths = vec![731, 130, 365, /* EOS */ 9999];
 
         for (frame, expected_len) in iter.zip(expected_lengths.iter()) {
             let Frame { header, .. } = frame.unwrap();
@@ -83,12 +162,13 @@ mod tests {
 
     #[test]
     fn test_frame_iter() {
-        let data = read("tests/sine_440hz_500ms.mp3").unwrap();
-        let iter = FrameIter::new(&data);
+        let data = read("tests/sine_440hz_500ms_vbr.mp3").unwrap();
+        let (first_frame, iter) = FrameIter::new(&data).unwrap();
+        assert!(matches!(first_frame, FirstFrame::Vbr(_, _)));
 
         let expected_bitrates = vec![
-            128, 224, 48, 40, 40, 32, 40, 32, 32, 40, 32, 40, 32, 32, 40, 32, 32, 32, 32, 32, 128,
-            32, /* EOS */ 9999,
+            224, 48, 40, 40, 32, 40, 32, 32, 40, 32, 40, 32, 32, 40, 32, 32, 32, 32, 32, 128, 32,
+            /* EOS */ 9999,
         ];
 
         for (frame, expected_bitrate) in iter.zip(expected_bitrates.iter()) {
