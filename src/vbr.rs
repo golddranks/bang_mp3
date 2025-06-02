@@ -47,8 +47,8 @@ impl VbrInfo {
     }
 
     pub fn read(header: &FrameHeader, data: &[u8]) -> Option<Result<Self, DecodingError>> {
-        let mut data = match (header.version, header.channel_mode) {
-            (Version::MPEG1, ch) => &data[SideInfo::len(ch)..],
+        let mut data = match header.version {
+            Version::MPEG1 => &data[SideInfo::len(header)..],
             _ => return Some(Err(DecodingError::UnsupportedVersion)),
         };
         if read_u32(&mut data) != Ok(u32::from_be_bytes(*b"Xing")) {

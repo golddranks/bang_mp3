@@ -1,3 +1,5 @@
+use std::ops::{Range, Shl, Shr};
+
 use header::FrameHeader;
 use side_info::SideInfo;
 use vbr::VbrInfo;
@@ -11,6 +13,7 @@ pub enum DecodingError {
     UnsupportedBitrate,
     UnsupportedSamplingRate,
     UnsupportedEmphasis,
+    InvalidBlockType,
 }
 
 mod decoder;
@@ -36,6 +39,23 @@ fn read_u32(data: &mut &[u8]) -> Result<u32, DecodingError> {
     );
     *data = &data[4..];
     Ok(int)
+}
+
+fn read_u64(data: &mut &[u8]) -> Result<u64, DecodingError> {
+    let int = u64::from_be_bytes(
+        data[..8]
+            .try_into()
+            .map_err(|_| DecodingError::UnexpectedEndOfStream)?,
+    );
+    *data = &data[8..];
+    Ok(int)
+}
+
+fn read_bits<T>(val: T, bits: Range<u8>) -> T
+where
+    T: Shl<u8, Output = T> + Shr<u8, Output = T>,
+{
+    (val << bits.start) >> (bits.start + size_of::<T>() as u8 * 8 - bits.end)
 }
 
 pub enum FirstFrame<'a> {
@@ -82,7 +102,7 @@ impl<'a> Frame<'a> {
         header: FrameHeader,
         frame_data: &'a [u8],
     ) -> Result<Frame<'a>, DecodingError> {
-        let side_info_len = SideInfo::len(header.channel_mode);
+        let side_info_len = SideInfo::len(&header);
         let side_info = SideInfo::read(&header, &frame_data[..side_info_len])?;
         let main_data = &frame_data[side_info_len..];
 
@@ -176,5 +196,36 @@ mod tests {
             assert_eq!(header.sampling_rate, 44100);
             assert_eq!(header.bitrate, *expected_bitrate);
         }
+    }
+
+    #[test]
+    fn test_read_bits() {
+        assert_eq!(read_bits(0xFFFFFFFF00000000, 0..32), 0xFFFFFFFF_u64);
+        assert_eq!(read_bits(0x00000000FFFFFFFF, 32..64), 0xFFFFFFFF_u64);
+        assert_eq!(read_bits(0x0000FFFFFFFF0000, 16..48), 0xFFFFFFFF_u64);
+        assert_eq!(read_bits(0x00000000FFFFFFFF, 0..32), 0x00000000_u64);
+        assert_eq!(read_bits(0xFFFFFFFF00000000, 32..64), 0x00000000_u64);
+        assert_eq!(read_bits(0xFFFF00000000FFFF, 16..48), 0x00000000_u64);
+    }
+
+    #[test]
+    fn test_read_u16() {
+        let mut data = b"\xAB\xCD".as_slice();
+        assert_eq!(read_u16(&mut data).unwrap(), 0xABCD_u16);
+        assert_eq!(data.len(), 0);
+    }
+
+    #[test]
+    fn test_read_u32() {
+        let mut data = b"\x89\xAB\xCD\xEF".as_slice();
+        assert_eq!(read_u32(&mut data).unwrap(), 0x89AB_CDEF_u32);
+        assert_eq!(data.len(), 0);
+    }
+
+    #[test]
+    fn test_read_u64() {
+        let mut data = b"\x89\xAB\xCD\xEF\x01\x23\x45\x67".as_slice();
+        assert_eq!(read_u64(&mut data).unwrap(), 0x89AB_CDEF_0123_4567_u64);
+        assert_eq!(data.len(), 0);
     }
 }
